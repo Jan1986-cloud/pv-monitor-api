@@ -23,7 +23,7 @@ from app.auth import (
     verify_password, get_password_hash, create_access_token,
     get_current_user, require_admin,
 )
-from app.epex import fetch_day_ahead_prices, get_current_price
+from app.epex import fetch_day_ahead_prices, fetch_today_prices, get_current_price
 from app.simulation import run_battery_simulation
 
 logging.basicConfig(level=logging.INFO)
@@ -44,6 +44,12 @@ async def lifespan(app: FastAPI):
     )
     scheduler.start()
     logger.info("EPEX scheduler started - daily at 15:00 CET")
+        # Fetch today's prices at startup
+    try:
+        await fetch_today_prices()
+        logger.info("Startup EPEX fetch completed")
+    except Exception as e:
+        logger.error(f"Startup EPEX fetch failed: {e}")
     yield
     scheduler.shutdown()
 
