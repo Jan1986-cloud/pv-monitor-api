@@ -2,13 +2,14 @@
 FastAPI backend for solar PV telemetry, EPEX prices, and battery simulation."""
 import asyncio
 import logging
+import os
 from contextlib import asynccontextmanager
 from datetime import datetime, timedelta, timezone
 from typing import Optional
 
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from apscheduler.triggers.cron import CronTrigger
-from fastapi import FastAPI, Depends, HTTPException, Query
+from fastapi import FastAPI, Depends, HTTPException, Query, Header
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.security import OAuth2PasswordRequestForm
 from pydantic import BaseModel, Field
@@ -27,13 +28,14 @@ from app.simulation import run_battery_simulation
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
-
 scheduler = AsyncIOScheduler(timezone="Europe/Amsterdam")
-
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    # Startup: schedule EPEX fetch daily at 15:00 CET
+    # Create tables if not exist
+    Base.metadata.create_all(bind=engine)
+    logger.info("Database tables created/verified")
+    # Schedule EPEX fetch daily at 15:00 CET
     scheduler.add_job(
         fetch_day_ahead_prices,
         CronTrigger(hour=15, minute=0, timezone="Europe/Amsterdam"),
@@ -44,7 +46,6 @@ async def lifespan(app: FastAPI):
     logger.info("EPEX scheduler started - daily at 15:00 CET")
     yield
     scheduler.shutdown()
-
 
 app = FastAPI(
     title="PV Monitor API",
@@ -61,7 +62,6 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-
 # === Pydantic Schemas ===
 class TelemetryPayload(BaseModel):
     system_id: str
@@ -74,13 +74,17 @@ class UserCreate(BaseModel):
     password: str
     role: str = "client"
 
+class LoginRequest(BaseModel):
+    username: str
+    password: str
+
 class SurchargeUpdate(BaseModel):
     surcharge_kwh: float
 
 class BatterySimRequest(BaseModel):
     system_id: str
-    bat_cap_kwh: float = 50.0
-    bat_max_pwr_kw: float = 25.0
+    battery_capacity_kwh: float = 50.0
+    max_charge_rate_kw: float = 25.0
     efficiency: float = 0.95
     days: int = 30
 
@@ -89,12 +93,10 @@ class TokenResponse(BaseModel):
     token_type: str = "bearer"
     role: str
 
-
 # === Health ===
 @app.get("/health")
 def health():
     return {"status": "ok", "service": "pv-monitor-api"}
-
 
 # === Auth Routes ===
 @app.post("/auth/register", response_model=TokenResponse)
@@ -113,24 +115,29 @@ def register(user_data: UserCreate, db: Session = Depends(get_db)):
     token = create_access_token({"sub": str(user.id), "role": user.role})
     return {"access_token": token, "role": user.role}
 
-
 @app.post("/auth/login", response_model=TokenResponse)
-def login(form: OAuth2PasswordRequestForm = Depends(), db: Session = Depends(get_db)):
-    user = db.query(User).filter(User.email == form.username).first()
-    if not user or not verify_password(form.password, user.password_hash):
+def login(login_data: LoginRequest, db: Session = Depends(get_db)):
+    """Login with JSON body {username, password}."""
+    user = db.query(User).filter(User.email == login_data.username).first()
+    if not user or not verify_password(login_data.password, user.password_hash):
         raise HTTPException(401, "Onjuiste inloggegevens")
     token = create_access_token({"sub": str(user.id), "role": user.role})
     return {"access_token": token, "role": user.role}
 
-
-# === ESP32 Webhook ===
+# === ESP32 Webhook (beveiligd met X-API-KEY) ===
 @app.post("/webhook")
-def ingest_telemetry(payload: TelemetryPayload, db: Session = Depends(get_db)):
-    """Receive telemetry from ESP32 every 15 seconds."""
+def ingest_telemetry(
+    payload: TelemetryPayload,
+    x_api_key: Optional[str] = Header(None, alias="X-API-KEY"),
+    db: Session = Depends(get_db)
+):
+    """Receive telemetry from ESP32. Requires X-API-KEY header."""
+    expected_key = os.getenv("ESP32_API_KEY", "")
+    if not expected_key or x_api_key != expected_key:
+        raise HTTPException(status_code=403, detail="Ongeldige of ontbrekende API key")
     inv40_w = payload.inv40k.get("actual_w", 0)
     inv50_w = payload.inv50k.get("actual_w", 0)
     pv_v_avg = (payload.inv40k.get("pv_v", 0) + payload.inv50k.get("pv_v", 0)) / 2
-
     record = TelemetryData(
         timestamp=datetime.now(timezone.utc),
         system_id=payload.system_id,
@@ -142,7 +149,6 @@ def ingest_telemetry(payload: TelemetryPayload, db: Session = Depends(get_db)):
     db.add(record)
     db.commit()
     return {"status": "ok", "recorded": True}
-
 
 # === Live Dashboard Data ===
 @app.get("/api/live/{system_id}")
@@ -156,17 +162,13 @@ def get_live_data(system_id: str, db: Session = Depends(get_db), user: User = De
     )
     if not latest:
         raise HTTPException(404, "Geen data voor dit systeem")
-
     production_total = (latest.inv_40k_w or 0) + (latest.inv_50k_w or 0)
     grid = latest.p1_grid_w
     consumption = production_total + grid
     self_consumption = min(production_total, consumption) if consumption > 0 else 0
-
     current_rate = get_current_price(db) + (user.dynamic_surcharge or 0)
     self_consumption_kw = self_consumption / 1000.0
     savings_per_hour = self_consumption_kw * current_rate
-
-    # Today's savings
     today_start = datetime.now(timezone.utc).replace(hour=0, minute=0, second=0, microsecond=0)
     today_records = (
         db.query(TelemetryData)
@@ -181,7 +183,6 @@ def get_live_data(system_id: str, db: Session = Depends(get_db), user: User = De
         cons = prod + r.p1_grid_w
         sc = min(prod, cons) if cons > 0 else 0
         savings_today += (sc / 1000.0) * current_rate * (15 / 3600)
-
     return {
         "live": {
             "grid": grid,
@@ -198,20 +199,18 @@ def get_live_data(system_id: str, db: Session = Depends(get_db), user: User = De
         },
     }
 
-
 # === Battery Simulation ===
 @app.post("/api/simulate")
 def simulate_battery(req: BatterySimRequest, db: Session = Depends(get_db), user: User = Depends(get_current_user)):
     result = run_battery_simulation(
         db=db,
         system_id=req.system_id,
-        bat_cap_kwh=req.bat_cap_kwh,
-        bat_max_pwr_kw=req.bat_max_pwr_kw,
+        bat_cap_kwh=req.battery_capacity_kwh,
+        bat_max_pwr_kw=req.max_charge_rate_kw,
         efficiency=req.efficiency,
         days=req.days,
     )
     return result
-
 
 # === Admin Routes ===
 @app.get("/admin/systems")
@@ -235,6 +234,21 @@ def list_systems(db: Session = Depends(get_db), admin: User = Depends(require_ad
         for s in systems
     ]
 
+@app.post("/admin/users", response_model=dict)
+def create_user(user_data: UserCreate, db: Session = Depends(get_db), admin: User = Depends(require_admin)):
+    """Admin: maak nieuw klant-account aan."""
+    existing = db.query(User).filter(User.email == user_data.email).first()
+    if existing:
+        raise HTTPException(400, "Email al geregistreerd")
+    user = User(
+        email=user_data.email,
+        password_hash=get_password_hash(user_data.password),
+        role=user_data.role,
+    )
+    db.add(user)
+    db.commit()
+    db.refresh(user)
+    return {"id": str(user.id), "email": user.email, "role": user.role}
 
 @app.put("/admin/surcharge")
 def update_surcharge(data: SurchargeUpdate, db: Session = Depends(get_db), admin: User = Depends(require_admin)):
@@ -244,12 +258,10 @@ def update_surcharge(data: SurchargeUpdate, db: Session = Depends(get_db), admin
         db.commit()
     return {"status": "ok", "new_surcharge_kwh": data.surcharge_kwh}
 
-
 @app.get("/admin/users")
 def list_users(db: Session = Depends(get_db), admin: User = Depends(require_admin)):
     users = db.query(User).all()
     return [{"id": str(u.id), "email": u.email, "role": u.role, "surcharge": u.dynamic_surcharge} for u in users]
-
 
 # === EPEX Prices ===
 @app.get("/api/prices")
@@ -270,7 +282,6 @@ def get_prices(hours: int = Query(24, ge=1, le=168), db: Session = Depends(get_d
         }
         for p in prices
     ]
-
 
 @app.post("/admin/fetch-prices")
 async def manual_fetch_prices(admin: User = Depends(require_admin)):
