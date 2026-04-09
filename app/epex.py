@@ -14,13 +14,9 @@ FALLBACK_PRICE_KWH = 0.25  # EUR/kWh fallback
 ENERGYZERO_URL = "https://api.energyzero.nl/v1/energyprices"
 
 
-async def fetch_day_ahead_prices():
-    """Fetch day-ahead prices for tomorrow from EnergyZero (free, no API key needed).
-    Called daily at 15:00 CET via APScheduler."""
-    tomorrow = datetime.now(timezone.utc) + timedelta(days=1)
-    from_date = tomorrow.replace(hour=0, minute=0, second=0, microsecond=0)
+async def _fetch_prices_for_date(from_date: datetime):
+    """Fetch prices for a specific date from EnergyZero and store in DB."""
     till_date = from_date + timedelta(days=1)
-
     params = {
         "fromDate": from_date.strftime("%Y-%m-%dT%H:%M:%S.000Z"),
         "tillDate": till_date.strftime("%Y-%m-%dT%H:%M:%S.000Z"),
@@ -38,10 +34,11 @@ async def fetch_day_ahead_prices():
 
         prices = data.get("Prices", [])
         if not prices:
-            logger.warning("EnergyZero returned empty prices, using fallback")
+            logger.warning(f"EnergyZero returned empty prices for {from_date.date()}, using fallback")
             _insert_fallback_prices(db, from_date)
             return
 
+        count = 0
         for entry in prices:
             price_kwh = entry.get("price", FALLBACK_PRICE_KWH)
             price_mwh = price_kwh * 1000  # Convert kWh -> MWh for storage
@@ -52,25 +49,43 @@ async def fetch_day_ahead_prices():
                 EnergyPrice.start_time == slot_start,
                 EnergyPrice.end_time == slot_end
             ).first()
+
             if not existing:
                 db.add(EnergyPrice(
                     start_time=slot_start,
                     end_time=slot_end,
                     base_price_mwh=price_mwh,
                 ))
+                count += 1
 
         db.commit()
-        logger.info(f"EPEX prices fetched via EnergyZero for {from_date.date()} ({len(prices)} slots)")
+        logger.info(f"EPEX prices fetched for {from_date.date()} ({count} new slots from {len(prices)} total)")
 
     except Exception as e:
         db.rollback()
-        logger.error(f"EnergyZero API error: {e}. Inserting fallback prices.")
+        logger.error(f"EnergyZero API error for {from_date.date()}: {e}. Inserting fallback prices.")
         try:
             _insert_fallback_prices(db, from_date)
         except Exception as fb_err:
             logger.error(f"Fallback price insertion failed: {fb_err}")
     finally:
         db.close()
+
+
+async def fetch_day_ahead_prices():
+    """Fetch day-ahead prices for tomorrow from EnergyZero.
+    Called daily at 15:00 CET via APScheduler."""
+    tomorrow = datetime.now(timezone.utc) + timedelta(days=1)
+    from_date = tomorrow.replace(hour=0, minute=0, second=0, microsecond=0)
+    await _fetch_prices_for_date(from_date)
+
+
+async def fetch_today_prices():
+    """Fetch today's prices from EnergyZero.
+    Called at startup to ensure current prices are available."""
+    today = datetime.now(timezone.utc)
+    from_date = today.replace(hour=0, minute=0, second=0, microsecond=0)
+    await _fetch_prices_for_date(from_date)
 
 
 def _insert_fallback_prices(db: Session, from_date: datetime):
