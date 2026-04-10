@@ -1,5 +1,5 @@
 import uuid
-from sqlalchemy import Column, String, Integer, Float, DateTime, Enum, DECIMAL, Computed
+from sqlalchemy import Column, String, Integer, Float, DateTime, Enum, DECIMAL, Computed, Index
 from sqlalchemy.dialects.postgresql import UUID
 from datetime import datetime, timezone
 from app.database import Base
@@ -36,4 +36,9 @@ class EnergyPrice(Base):
     end_time = Column(DateTime(timezone=True), nullable=False)
     base_price_mwh = Column(DECIMAL(10, 4), nullable=False)
     surcharge_kwh = Column(DECIMAL(10, 6), default=0.0)
+    interval_minutes = Column(Integer, nullable=False, default=60)  # 60=hourly, 15=quarter
     fetched_at = Column(DateTime(timezone=True), default=lambda: datetime.now(timezone.utc))
+
+    __table_args__ = (
+        Index('ix_energy_prices_interval_start', 'interval_minutes', 'start_time'),
+    )
