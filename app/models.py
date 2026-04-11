@@ -22,10 +22,14 @@ class TelemetryData(Base):
     timestamp = Column(DateTime(timezone=True), primary_key=True)
     system_id = Column(String(50), primary_key=True)
     p1_grid_w = Column(Integer, nullable=False)
-    inv_40k_w = Column(Integer, default=0)
-    inv_50k_w = Column(Integer, default=0)
-    inv_total_w = Column(Integer, Computed("inv_40k_w + inv_50k_w"))
-    pv_v_avg = Column(Float)
+    total_limit_w = Column(Integer, default=0)
+    inv_40k_limit_w = Column(Integer, default=0)
+    inv_40k_actual_w = Column(Integer, default=0)
+    inv_40k_pv_v = Column(Float, default=0.0)
+    inv_50k_limit_w = Column(Integer, default=0)
+    inv_50k_actual_w = Column(Integer, default=0)
+    inv_50k_pv_v = Column(Float, default=0.0)
+    inv_total_w = Column(Integer, Computed("inv_40k_actual_w + inv_50k_actual_w"))
 
 
 class EnergyPrice(Base):
