@@ -33,10 +33,11 @@ scheduler = AsyncIOScheduler(timezone="Europe/Amsterdam")
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    # Drop and recreate telemetry_data to migrate schema without Alembic
+    # Drop and recreate telemetry_data + energy_prices to migrate schema without Alembic
     TelemetryData.__table__.drop(engine, checkfirst=True)
+    EnergyPrice.__table__.drop(engine, checkfirst=True)
     Base.metadata.create_all(bind=engine)
-    logger.info("Database tables created/verified (telemetry_data recreated)")
+    logger.info("Database tables created/verified (telemetry_data + energy_prices recreated)")
     # Schedule EPEX fetch daily at 15:00 CET
     scheduler.add_job(
         fetch_day_ahead_prices,
@@ -59,7 +60,7 @@ async def lifespan(app: FastAPI):
 app = FastAPI(
     title="PV Monitor API",
     description="Scheepswerf zonnestroom monitoring",
-    version="2.0.0",
+    version="2.1.0",
     lifespan=lifespan,
 )
 
@@ -107,7 +108,7 @@ class SurchargeUpdate(BaseModel):
 
 @app.get("/")
 def root():
-    return {"status": "online", "service": "pv-monitor-api", "version": "2.0.0"}
+    return {"status": "online", "service": "pv-monitor-api", "version": "2.1.0"}
 
 @app.get("/health")
 def health():
@@ -175,9 +176,8 @@ def get_live_data(system_id: str, db: Session = Depends(get_db), user: User = De
     consumption = production_total + grid
     self_consumption = min(production_total, consumption) if consumption > 0 else 0
 
-    # Current EPEX price
-    current_price = get_current_price(db)
-    price_kwh = current_price["price_kwh"] if current_price else 0.25
+    # Current EPEX price (returns float directly)
+    price_kwh = get_current_price(db)
     surcharge = user.dynamic_surcharge or 0.0
     effective_price = round(price_kwh + surcharge, 4)
 
